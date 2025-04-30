@@ -1,0 +1,155 @@
+name: nyc-crashes-etl
+
+volumes:
+  nyc-crashes:
+
+services:
+  extract-data:
+    container_name: etl_extract_data
+    image: python:3.11
+    user: root
+    volumes:
+      - nyc-crashes:/data
+    working_dir: /data
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+
+        echo "Resetting dataset directory..."
+        rm -rf nyc-crashes
+        mkdir -p nyc-crashes
+        cd nyc-crashes
+
+        echo "Downloading dataset CSV..."
+        curl -L "https://data.cityofnewyork.us/api/views/h9gi-nx95/rows.csv?accessType=DOWNLOAD" \
+          -o collisions.csv
+
+        echo "Listing contents of /data after extract stage:"
+        ls -l /data
+
+  transform-data:
+    container_name: etl_transform_data
+    image: python:3.11
+    volumes:
+      - nyc-crashes:/data
+    working_dir: /data/nyc-crashes
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+
+        python3 -c '
+        import pandas as pd
+        import os
+        
+        # Load the CSV file
+        df = pd.read_csv("collisions.csv")
+        
+        # Basic preprocessing - drop rows with all NaN values
+        df = df.dropna(how="all")
+
+        classification_id = []
+        for i in df.number_of_persons_injured:
+            if(int(i) == 0):
+                classification_id.append(0) # Safe
+            elif (int(i) == 1):
+                classification_id.append(1) # Caution
+            elif(int(i) > 1):
+                classification_id.append(2) # Dangerous
+
+        df["classification_id"] = classification_id
+
+        ohe_borough = []
+        for i in df.borough:
+          if(i == "BROOKLYN"):
+            ohe_borough.append(0)
+          elif(i == "BRONX"):
+            ohe_borough.append(1)
+          elif(i == "MANHATTAN"):
+            ohe_borough.append(2)
+          elif(i == "STATEN_ISLAND"):
+            ohe_borough.append(3)
+          else:  #QUEENS
+            ohe_borough.append(4)
+
+        df["ohe_borough"] = ohe_borough
+
+        from datetime import datetime
+        time_format = "%H:%M"
+        ohe_crash_time = []
+        for i in df.crash_time:
+          timeObject = datetime.strptime(i,time_format)
+          hours = timeObject.hour
+          minutes = timeObject.minute
+          seconds = timeObject.second
+          time_in_seconds = (hours*3600) + (minutes * 60) + seconds
+          ohe_crash_time.append(time_in_seconds)
+
+        df["ohe_crash_time"] = ohe_crash_time
+
+        ohe_dayOfWeek = []
+        ohe_month = []
+        for i in df.crash_date:
+          selectedDateTime = pd.to_datetime(i).date()
+          weekDay = selectedDateTime.weekday()
+          month = selectedDateTime.month
+          ohe_dayOfWeek.append(weekDay)
+          ohe_month.append(month)
+
+        df["ohe_dayOfWeek"] = ohe_dayOfWeek
+        df["ohe_month"] = ohe_month
+
+        features = ["latitude", "longitude", "ohe_crash_time", "ohe_dayOfWeek", "ohe_month"]
+        df.dropna(subset=features,inplace=True)
+        
+
+        # Split the dataset by year
+        if "CRASH DATE" in df.columns:
+            # Convert CRASH DATE to datetime
+            df["CRASH DATE"] = pd.to_datetime(df["CRASH DATE"], errors="coerce")
+            
+            # Extract year
+            df["YEAR"] = df["CRASH DATE"].dt.year
+            
+            # Create directories for each year and save data
+            for year, year_df in df.groupby("YEAR"):
+                if pd.notna(year):
+                    year_dir = f"year_{int(year)}"
+                    os.makedirs(year_dir, exist_ok=True)
+                    year_df.to_csv(f"{year_dir}/collisions_{int(year)}.csv", index=False)
+        '
+
+        echo "Listing contents of /data/nyc-crashes after transform stage:"
+        ls -l /data/nyc-crashes
+        echo "Year directories:"
+        find /data/nyc-crashes -type d -name "year_*" | sort
+
+  load-data:
+    container_name: etl_load_data
+    image: rclone/rclone:latest
+    volumes:
+      - nyc-crashes:/data
+      - ~/.config/rclone/rclone.conf:/root/.config/rclone/rclone.conf:ro
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        if [ -z "$RCLONE_CONTAINER" ]; then
+          echo "ERROR: RCLONE_CONTAINER is not set"
+          exit 1
+        fi
+        echo "Cleaning up existing contents of container..."
+        rclone delete chi_tacc:$RCLONE_CONTAINER --rmdirs || true
+
+        rclone copy /data/nyc-crashes chi_tacc:$RCLONE_CONTAINER \
+        --progress \
+        --transfers=32 \
+        --checkers=16 \
+        --multi-thread-streams=4 \
+        --fast-list
+
+        echo "Listing directories in container after load stage:"
+        rclone lsd chi_tacc:$RCLONE_CONTAINER
